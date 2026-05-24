@@ -5,6 +5,7 @@ from app.control.model.spec import ModelSpec
 from app.control.account.runtime import get_refresh_service
 from app.dataplane.account.selector import current_strategy
 from app.platform.config.snapshot import get_config
+from app.platform.errors import AppError, ErrorKind, RateLimitError
 
 # Random strategy has no config key for retry count; it is pinned here so that
 # every retry-driven call site (chat / images / video / anthropic) sees the same
@@ -39,6 +40,57 @@ def mode_candidates(spec: ModelSpec) -> tuple[int, ...]:
     ):
         return (primary, int(ModeId.FAST), int(ModeId.EXPERT))
     return (primary,)
+
+
+def normalize_account(value: str | None) -> str | None:
+    """Return a cleaned explicit-account token, or None when not provided."""
+    if value is None:
+        return None
+    token = value.strip()
+    if token.startswith("sso="):
+        token = token[4:]
+    return token or None
+
+
+async def reserve_explicit_account(
+    directory,
+    token: str,
+    mode_id: int,
+    *,
+    require_quota: bool = True,
+    now_s_override: int | None = None,
+):
+    """Reserve a caller-specified account, raising a mapped error on failure.
+
+    Used when a request pins execution to a single account: there is no
+    failover to other accounts, and an exhausted/invalid account surfaces
+    the corresponding error directly to the API caller.
+    """
+    lease, reason = await directory.reserve_token(
+        token,
+        mode_id,
+        require_quota=require_quota,
+        now_s_override=now_s_override,
+    )
+    if lease is not None:
+        return lease
+    if reason == "not_found":
+        raise AppError(
+            "Specified account was not found",
+            kind=ErrorKind.VALIDATION,
+            code="account_not_found",
+            status=404,
+            details={"param": "account"},
+        )
+    if reason == "inactive":
+        raise AppError(
+            "Specified account is not active",
+            kind=ErrorKind.VALIDATION,
+            code="account_inactive",
+            status=409,
+            details={"param": "account"},
+        )
+    raise RateLimitError("Specified account has no remaining quota")
 
 
 async def reserve_account(

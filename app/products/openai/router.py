@@ -34,6 +34,7 @@ _TAG_RESPONSES = "OpenAI - Responses"
 _TAG_IMAGES = "OpenAI - Images"
 _TAG_VIDEOS = "OpenAI - Videos"
 _TAG_FILES = "OpenAI - Files"
+_TAG_ACCOUNTS = "OpenAI - Accounts"
 
 
 async def _available_pools(request: Request) -> frozenset[str]:
@@ -107,6 +108,62 @@ async def get_model_endpoint(model_id: str, request: Request):
             "name": spec.public_name,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# /v1/accounts — per-account quota / status (for explicit account selection)
+# ---------------------------------------------------------------------------
+
+
+def _quota_brief(quota: dict) -> dict:
+    out: dict[str, dict[str, int]] = {}
+    for mode in ("auto", "fast", "expert", "heavy"):
+        v = quota.get(mode)
+        if isinstance(v, dict):
+            out[mode] = {
+                "remaining": int(v.get("remaining", 0) or 0),
+                "total": int(v.get("total", 0) or 0),
+            }
+    return out
+
+
+@router.get("/accounts", tags=[_TAG_ACCOUNTS], dependencies=[Depends(verify_api_key)])
+async def list_accounts_endpoint(request: Request):
+    """List accounts with quota/status so callers can pin a request to one.
+
+    The ``token`` returned here is the value to pass as the ``account`` field
+    on image/video requests.
+    """
+    from app.control.account.commands import ListAccountsQuery
+
+    repo = getattr(request.app.state, "repository", None)
+    if repo is None:
+        return JSONResponse({"object": "list", "data": []})
+
+    items: list = []
+    page_num = 1
+    while True:
+        page = await repo.list_accounts(
+            ListAccountsQuery(page=page_num, page_size=2000)
+        )
+        items.extend(page.items)
+        if page_num * 2000 >= page.total:
+            break
+        page_num += 1
+
+    data = [
+        {
+            "token": r.token,
+            "pool": r.pool or "basic",
+            "status": r.status,
+            "quota": _quota_brief(r.quota) if isinstance(r.quota, dict) else {},
+            "use_count": r.usage_use_count or 0,
+            "last_used_at": r.last_use_at,
+            "tags": r.tags or [],
+        }
+        for r in items
+    ]
+    return JSONResponse({"object": "list", "data": data})
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +303,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 response_format=cfg.response_format or "url",
                 stream=is_stream,
                 chat_format=True,
+                account=cfg.account,
             )
 
         elif spec.is_image():
@@ -275,6 +333,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 response_format=fmt,
                 stream=is_stream,
                 chat_format=True,
+                account=cfg.account,
             )
 
         elif spec.is_video():
@@ -292,6 +351,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 size=vcfg.size or "720x1280",
                 resolution_name=vcfg.resolution_name,
                 preset=vcfg.preset,
+                account=vcfg.account,
             )
 
         else:
@@ -451,6 +511,7 @@ async def image_generations(req: ImageGenerationRequest):
         response_format=req.response_format or "url",
         stream=False,
         chat_format=False,
+        account=req.account,
     )
     return JSONResponse(result)
 
@@ -475,6 +536,7 @@ async def videos_create(
     input_reference: Annotated[
         list[UploadFile] | None, File(alias="input_reference[]")
     ] = None,
+    account: Annotated[str | None, Form()] = None,
 ):
     from .video import create_video
 
@@ -493,6 +555,7 @@ async def videos_create(
         resolution_name=resolution_name,
         preset=preset,
         input_references=references_payload,
+        account=account,
     )
     return JSONResponse(result)
 
@@ -534,6 +597,7 @@ async def image_edits(
     n: Annotated[int, Form()] = 1,
     size: Annotated[str, Form()] = "1024x1024",
     response_format: Annotated[str, Form()] = "url",
+    account: Annotated[str | None, Form()] = None,
 ):
     spec = model_registry.get(model)
     if spec is None or not spec.enabled or not spec.is_image_edit():
@@ -565,6 +629,7 @@ async def image_edits(
         response_format=response_format,
         stream=False,
         chat_format=False,
+        account=account,
     )
     return JSONResponse(result)
 

@@ -17,6 +17,7 @@ class ImageConfig(BaseModel):
     n:               int | None = Field(1, ge=1, le=10)
     size:            str | None = "1024x1024"
     response_format: str | None = None
+    account:         str | None = None
 
 
 class VideoConfig(BaseModel):
@@ -24,6 +25,7 @@ class VideoConfig(BaseModel):
     size: Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"] | None = "720x1280"
     resolution_name: Literal["480p", "720p"] | None = None
     preset: Literal["fun", "normal", "spicy", "custom"] | None = None
+    account: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -47,6 +49,7 @@ class ImageGenerationRequest(BaseModel):
     n:               int | None = Field(1, ge=1, le=10)
     size:            str | None = "1024x1024"
     response_format: str | None = "url"
+    account:         str | None = None
 
 
 class ImageEditRequest(BaseModel):

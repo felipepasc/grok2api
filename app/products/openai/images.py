@@ -60,7 +60,11 @@ from .chat import (
     _quota_sync,
     _should_retry_upstream,
 )
-from app.products._account_selection import selection_max_retries
+from app.products._account_selection import (
+    normalize_account,
+    reserve_explicit_account,
+    selection_max_retries,
+)
 
 _X_USER_ID_RE = re.compile(r"(?:^|;\s*)x-userid=([^;]+)")
 
@@ -278,6 +282,7 @@ async def generate(
     response_format: str  = "url",
     stream:          bool = False,
     chat_format:     bool = False,
+    account:         str | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Generate images.
 
@@ -294,6 +299,7 @@ async def generate(
     spec         = resolve_model(model)
     aspect_ratio = resolve_aspect_ratio(size)
     enable_nsfw  = cfg.get_bool("features.enable_nsfw", True)
+    account      = normalize_account(account)
 
     from app.dataplane.account import _directory as _acct_dir
     if _acct_dir is None:
@@ -308,12 +314,20 @@ async def generate(
             response_format = response_format,
             stream          = stream,
             chat_format     = chat_format,
+            account         = account,
         )
 
-    acct = await _acct_dir.reserve_any(
-        spec.pool_candidates(),
-        now_s_override=now_s(),
-    )
+    if account is not None:
+        # WS image gen manages its own upstream rate limiting → quota-agnostic.
+        acct = await reserve_explicit_account(
+            _acct_dir, account, int(spec.mode_id),
+            require_quota=False, now_s_override=now_s(),
+        )
+    else:
+        acct = await _acct_dir.reserve_any(
+            spec.pool_candidates(),
+            now_s_override=now_s(),
+        )
     if acct is None:
         raise RateLimitError("No available accounts for image generation")
 
@@ -493,6 +507,7 @@ async def _generate_lite(
     response_format: str,
     stream:          bool,
     chat_format:     bool,
+    account:         str | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Generate images via the chat endpoint (Aurora model path).
 
@@ -524,6 +539,7 @@ async def _generate_lite(
                     timeout_s=timeout_s,
                     response_format=response_format,
                     progress_cb=_progress,
+                    account=account,
                 )
             )
 
@@ -569,6 +585,7 @@ async def _generate_lite(
         n=n,
         timeout_s=timeout_s,
         response_format=response_format,
+        account=account,
         progress_cb=lambda idx, progress: _lite_progress_updates(
             idx=idx,
             progress=progress,
@@ -977,23 +994,31 @@ async def _run_lite_request(
     timeout_s: float,
     response_format: str,
     progress_cb: Callable[[int], Awaitable[None]] | None = None,
+    account:   str | None = None,
 ) -> _ImageOutput:
     from app.dataplane.account import _directory as _acct_dir
 
     if _acct_dir is None:
         raise RateLimitError("Account directory not initialised")
 
-    max_retries = selection_max_retries()
+    # Explicit account → single attempt, no failover to other accounts.
+    max_retries = 0 if account is not None else selection_max_retries()
     retry_codes = _configured_retry_codes(get_config())
     excluded: list[str] = []
 
     for attempt in range(max_retries + 1):
-        acct = await _acct_dir.reserve(
-            pool_candidates=spec.pool_candidates(),
-            mode_id=int(spec.mode_id),
-            now_s_override=now_s(),
-            exclude_tokens=excluded or None,
-        )
+        if account is not None:
+            acct = await reserve_explicit_account(
+                _acct_dir, account, int(spec.mode_id),
+                require_quota=True, now_s_override=now_s(),
+            )
+        else:
+            acct = await _acct_dir.reserve(
+                pool_candidates=spec.pool_candidates(),
+                mode_id=int(spec.mode_id),
+                now_s_override=now_s(),
+                exclude_tokens=excluded or None,
+            )
         if acct is None:
             raise RateLimitError("No available accounts for image generation")
 
@@ -1083,6 +1108,7 @@ async def _run_lite_batch(
     timeout_s: float,
     response_format: str,
     progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
+    account:   str | None = None,
 ) -> list[_ImageOutput]:
     results: list[_ImageOutput | None] = [None] * n
 
@@ -1092,6 +1118,7 @@ async def _run_lite_batch(
             prompt=prompt,
             timeout_s=timeout_s,
             response_format=response_format,
+            account=account,
             progress_cb=None if progress_cb is None else lambda progress: progress_cb(idx, progress),
         )
 
@@ -1111,6 +1138,7 @@ async def edit(
     response_format: str  = "url",
     stream:          bool = False,
     chat_format:     bool = False,
+    account:         str | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Edit images via media/post/create + imagine-image-edit chat payload."""
     cfg = get_config()
@@ -1119,6 +1147,7 @@ async def edit(
     if not (1 <= n <= _EDIT_MAX_N):
         raise ValidationError("image edit n must be between 1 and 2", param="n")
     _normalize_edit_size(size)
+    account = normalize_account(account)
 
     prompt, image_inputs = _extract_edit_prompt_and_inputs(messages)
 
@@ -1126,11 +1155,17 @@ async def edit(
     if _acct_dir is None:
         raise RateLimitError("Account directory not initialised")
 
-    acct = await _acct_dir.reserve(
-        pool_candidates = spec.pool_candidates(),
-        mode_id         = int(spec.mode_id),
-        now_s_override  = now_s(),
-    )
+    if account is not None:
+        acct = await reserve_explicit_account(
+            _acct_dir, account, int(spec.mode_id),
+            require_quota=True, now_s_override=now_s(),
+        )
+    else:
+        acct = await _acct_dir.reserve(
+            pool_candidates = spec.pool_candidates(),
+            mode_id         = int(spec.mode_id),
+            now_s_override  = now_s(),
+        )
     if acct is None:
         raise RateLimitError("No available accounts for image edit")
 

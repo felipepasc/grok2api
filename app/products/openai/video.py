@@ -53,6 +53,7 @@ from ._format import (
     make_thinking_chunk,
 )
 from .chat import _fail_sync, _quota_sync, _feedback_kind
+from app.products._account_selection import normalize_account, reserve_explicit_account
 
 _IMAGE_MEDIA_TYPE = "MEDIA_POST_TYPE_IMAGE"
 _VIDEO_MEDIA_TYPE = "MEDIA_POST_TYPE_VIDEO"
@@ -747,6 +748,7 @@ async def _run_video_with_account(
     *,
     model: str,
     runner: Callable[[str, float], Awaitable[Any]],
+    account: str | None = None,
 ) -> Any:
     cfg = get_config()
     timeout_s = cfg.get_float("video.timeout", 180.0)
@@ -759,11 +761,17 @@ async def _run_video_with_account(
     if _acct_dir is None:
         raise RateLimitError("Account directory not initialised")
 
-    acct = await _acct_dir.reserve(
-        pool_candidates=spec.pool_candidates(),
-        mode_id=int(spec.mode_id),
-        now_s_override=now_s(),
-    )
+    if account is not None:
+        acct = await reserve_explicit_account(
+            _acct_dir, account, int(spec.mode_id),
+            require_quota=True, now_s_override=now_s(),
+        )
+    else:
+        acct = await _acct_dir.reserve(
+            pool_candidates=spec.pool_candidates(),
+            mode_id=int(spec.mode_id),
+            now_s_override=now_s(),
+        )
     if acct is None:
         raise RateLimitError("No available accounts for video generation")
 
@@ -831,6 +839,7 @@ async def _run_video_job(
     seconds: int,
     preset: str | None,
     input_references: list[dict[str, Any]] | None = None,
+    account: str | None = None,
 ) -> None:
     try:
         await _set_job_status(job, status="in_progress", progress=1)
@@ -847,11 +856,17 @@ async def _run_video_job(
         if _acct_dir is None:
             raise RateLimitError("Account directory not initialised")
 
-        acct = await _acct_dir.reserve(
-            pool_candidates=spec.pool_candidates(),
-            mode_id=int(spec.mode_id),
-            now_s_override=now_s(),
-        )
+        if account is not None:
+            acct = await reserve_explicit_account(
+                _acct_dir, account, int(spec.mode_id),
+                require_quota=True, now_s_override=now_s(),
+            )
+        else:
+            acct = await _acct_dir.reserve(
+                pool_candidates=spec.pool_candidates(),
+                mode_id=int(spec.mode_id),
+                now_s_override=now_s(),
+            )
         if acct is None:
             raise RateLimitError("No available accounts for video generation")
 
@@ -922,10 +937,13 @@ async def create_video(
     resolution_name: str | None = None,
     preset: str | None = None,
     input_references: list[dict[str, Any]] | None = None,
+    account: str | None = None,
 ) -> dict[str, Any]:
     spec = model_registry.get(model)
     if spec is None or not spec.enabled or not spec.is_video():
         raise ValidationError(f"Model {model!r} is not a video model", param="model")
+
+    account = normalize_account(account)
 
     cleaned_prompt = (prompt or "").strip()
     if not cleaned_prompt:
@@ -957,6 +975,7 @@ async def create_video(
             seconds=normalized_seconds,
             preset=preset,
             input_references=input_references,
+            account=account,
         )
     )
     asyncio.create_task(_expire_video_job(job.id))
@@ -1049,9 +1068,11 @@ async def completions(
     size: str = "720x1280",
     resolution_name: str | None = None,
     preset: str | None = None,
+    account: str | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Chat-completions video support on top of the same core flow."""
     validate_video_length(seconds)
+    account = normalize_account(account)
     aspect_ratio, default_resolution_name = _resolve_video_size(size)
     resolved_resolution_name = _resolve_video_resolution_name(
         resolution_name,
@@ -1084,7 +1105,9 @@ async def completions(
                 file_id=file_id,
             )
 
-        return await _run_video_with_account(model=model, runner=_runner)
+        return await _run_video_with_account(
+            model=model, runner=_runner, account=account
+        )
 
     if is_stream:
 

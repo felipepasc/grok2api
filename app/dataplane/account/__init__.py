@@ -18,7 +18,7 @@ from .lease import AccountLease, new_lease
 from .selector import current_strategy, select, select_any
 from .sync import bootstrap as _bootstrap, apply_changes
 from . import feedback as fb
-from ..shared.enums import POOL_ID_TO_STR, StatusId
+from ..shared.enums import POOL_ID_TO_STR, PoolId, StatusId
 
 if TYPE_CHECKING:
     pass
@@ -217,6 +217,85 @@ class AccountDirectory:
             mode_id=-1,  # no specific mode tracked for WS operations
             selected_at=ts,
         )
+
+    async def reserve_token(
+        self,
+        token: str,
+        mode_id: int,
+        *,
+        require_quota: bool = True,
+        now_s_override: int | None = None,
+    ) -> tuple[AccountLease | None, str]:
+        """Reserve a *specific* account by token, bypassing pool scoring.
+
+        Returns ``(lease, reason)`` where ``reason`` is one of:
+          - ``"ok"``        — reserved successfully
+          - ``"not_found"`` — token is not in the directory
+          - ``"inactive"``  — account status is not ACTIVE (disabled/expired/cooling)
+          - ``"no_quota"``  — local quota/cooldown indicates the account cannot run
+
+        When ``require_quota`` is False the per-mode quota gate is skipped
+        (only status and the random-strategy cooldown are checked), mirroring
+        the quota-agnostic ``reserve_any`` path used by WebSocket products.
+        """
+        table = self._table
+        if table is None:
+            return None, "not_found"
+
+        idx = table.idx_by_token.get(token)
+        if idx is None:
+            return None, "not_found"
+
+        ts = now_s_override if now_s_override is not None else now_s()
+
+        async with self._lock:
+            if int(table.status_by_idx[idx]) != int(StatusId.ACTIVE):
+                return None, "inactive"
+
+            if int(table.cooling_until_s_by_idx[idx]) > ts:
+                return None, "no_quota"
+
+            if require_quota and current_strategy() == "quota":
+                if self._explicit_quota_exhausted(table, idx, mode_id, ts):
+                    return None, "no_quota"
+
+            fb.increment_inflight(table, idx)
+            fb.update_last_use(table, idx, ts)
+            actual_pool = table.get_pool_id(idx)
+
+        return (
+            new_lease(
+                idx=idx,
+                token=token,
+                pool_id=actual_pool,
+                mode_id=mode_id,
+                selected_at=ts,
+            ),
+            "ok",
+        )
+
+    @staticmethod
+    def _explicit_quota_exhausted(
+        table: AccountRuntimeTable,
+        idx: int,
+        mode_id: int,
+        ts: int,
+    ) -> bool:
+        """Return True when *idx* has no usable quota for *mode_id* under the
+        quota strategy. A mode with no tracked window (window == 0) is treated
+        as "unknown" and never blocks — only an explicit remaining <= 0 does.
+        """
+        window = int(table._window_col(mode_id)[idx])
+        if window <= 0:
+            return False
+        # Inline window reset for basic-pool accounts (mirrors the selector).
+        reset = int(table._reset_col(mode_id)[idx])
+        if reset and ts >= reset and int(table.pool_by_idx[idx]) == int(PoolId.BASIC):
+            total = int(table._total_col(mode_id)[idx])
+            if total > 0:
+                table._quota_col(mode_id)[idx] = total
+                table._reset_col(mode_id)[idx] = ts + window
+        return int(table._quota_col(mode_id)[idx]) <= 0
 
     async def release(self, lease: AccountLease) -> None:
         """Decrement inflight counter for a finished request."""
